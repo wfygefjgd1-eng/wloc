@@ -77,8 +77,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     }
                 }
             }
-            self.packetFlow.writePackets(modified, withProtocols: protocols)
-            self.relayPackets()
+            // 使用 completionHandler 触发下一次读取，避免递归调用导致的栈增长
+            self.packetFlow.writePackets(modified, withProtocols: protocols) { _ in
+                self.relayPackets()
+            }
         }
     }
 

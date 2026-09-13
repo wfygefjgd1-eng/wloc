@@ -51,6 +51,8 @@ chmod +x generate_apple_wloc_p12.sh
 
 The script generates the certificates and automatically copies them to the App and Extension resource directories. The default `.p12` password is `app-wloc`, which matches `AppWLocConfig.proxyIdentityPassword`. If you change the password in the script, you must also update the app configuration.
 
+> Note: iOS 27.0 beta6 and later versions are currently blocked by Apple, so web-based location is unavailable. If you need to use this on iOS 27 release versions, you may need to downgrade your system.
+
 ### 3. Configure Bundle Identifiers
 
 Next, change the Bundle Identifiers and make sure the Tunnel identifier is the app identifier followed by `.tunnel`. For example:

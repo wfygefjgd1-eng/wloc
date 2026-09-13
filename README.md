@@ -52,6 +52,8 @@ chmod +x generate_apple_wloc_p12.sh
 
 脚本会生成证书并自动同步到 App/Extension 资源目录。默认 `.p12` 密码为 `app-wloc`，与 `AppWLocConfig.proxyIdentityPassword` 一致。如果你修改脚本密码，也必须同步修改应用配置。
 
+> 注意：iOS 27.0 beta6 及之后的版本由于苹果封堵，网页定位暂不可用。如需在 iOS 27 正式版上使用，可能需要降级系统版本。
+
 ### 3. 配置Bundle Identifier
 
 然后修改 Bundle Identifier，并保证 Tunnel 的标识为应用标识加 `.tunnel`。例如：

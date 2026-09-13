@@ -31,5 +31,10 @@ enum AppWLocConfig {
     static let wlocPath = "/clls/wloc"
     static let proxyIdentityResourceName = "AppWLocProxy"
     static let rootCertificateResourceName = "AppWLocRootCA"
-    static let proxyIdentityPassword = "1"
+    static let proxyIdentityPassword = "app-wloc"
+
+    // 集中管理默认定位参数，避免散落在多处硬编码
+    static let defaultAltitude: Double = 480
+    static let defaultHorizontalAccuracy: Int64 = 39
+    static let defaultVerticalAccuracy: Int64 = 1000
 }

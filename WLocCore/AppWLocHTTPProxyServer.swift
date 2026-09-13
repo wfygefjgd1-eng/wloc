@@ -2,6 +2,7 @@ import CFNetwork
 import Darwin
 import Foundation
 import Security
+import os
 
 enum AppWLocProxyError: Error, LocalizedError {
     case socketCreateFailed
@@ -55,6 +56,16 @@ final class AppWLocHTTPProxyServer {
     private var listenFD: Int32 = -1
     private var acceptSource: DispatchSourceRead?
     private let logHandler: LogHandler?
+
+    /// 共享的 URLSession，避免每次请求都创建新实例
+    private let sharedSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.connectionProxyDictionary = [:]
+        return URLSession(configuration: config)
+    }()
+
+    /// 使用 os.Logger 替代 print，支持按子系统和级别过滤
+    private let logger = Logger(subsystem: "com.nbmaster.wloc.proxy", category: "proxy")
 
     init(port: UInt16, logHandler: LogHandler? = nil) {
         self.port = port
@@ -135,31 +146,45 @@ final class AppWLocHTTPProxyServer {
             let connectRequest = try readProxyHeader(from: clientFD)
             let target = try parseConnectTarget(connectRequest)
             guard AppWLocConfig.appWLocHosts.contains(target.host) else {
-                throw AppWLocProxyError.unsupportedHost(target.host)
+                log("\(AppWLocConfig.displayName) 代理连接结束：不支持的域名 \(target.host)")
+                close(clientFD)
+                return
             }
 
             let identity: SecIdentity
             do {
                 identity = try AppWLocCertificateStore.shared.loadProxyIdentity()
             } catch {
-                throw AppWLocProxyError.tlsIdentityMissing(error)
+                log("\(AppWLocConfig.displayName) 代理连接结束：证书不可用")
+                close(clientFD)
+                return
             }
 
-            try writeAll(Data("HTTP/1.1 200 Connection Established\r\n\r\n".utf8), to: clientFD)
-            try handleTLSRequest(clientFD: clientFD, host: target.host, identity: identity)
+            do {
+                try writeAll(Data("HTTP/1.1 200 Connection Established\r\n\r\n".utf8), to: clientFD)
+            } catch {
+                log("\(AppWLocConfig.displayName) 代理连接结束：写入握手响应失败")
+                close(clientFD)
+                return
+            }
+
+            // TLS 处理改为异步，避免信号量阻塞 workerQueue
+            handleTLSRequest(clientFD: clientFD, host: target.host, identity: identity)
         } catch {
             log("\(AppWLocConfig.displayName) 代理连接结束：\(error.localizedDescription)")
             close(clientFD)
         }
     }
 
-    private func handleTLSRequest(clientFD: Int32, host: String, identity: SecIdentity) throws {
+    private func handleTLSRequest(clientFD: Int32, host: String, identity: SecIdentity) {
         var readStreamRef: Unmanaged<CFReadStream>?
         var writeStreamRef: Unmanaged<CFWriteStream>?
         CFStreamCreatePairWithSocket(kCFAllocatorDefault, clientFD, &readStreamRef, &writeStreamRef)
         guard let cfReadStream = readStreamRef?.takeRetainedValue(),
               let cfWriteStream = writeStreamRef?.takeRetainedValue() else {
-            throw AppWLocProxyError.tlsStreamCreateFailed
+            log("\(AppWLocConfig.displayName) TLS 流创建失败")
+            close(clientFD)
+            return
         }
 
         let sslSettings = [
@@ -178,33 +203,70 @@ final class AppWLocHTTPProxyServer {
         let outputStream = cfWriteStream as OutputStream
 
         guard CFReadStreamOpen(cfReadStream), CFWriteStreamOpen(cfWriteStream) else {
-            throw AppWLocProxyError.tlsOpenFailed
+            log("\(AppWLocConfig.displayName) TLS 握手失败")
+            inputStream.close()
+            outputStream.close()
+            close(clientFD)
+            return
         }
-        defer {
+
+        do {
+            let request = try readHTTPRequest(from: inputStream, host: host)
+            let shouldLogWLoc = isWLocRequest(request)
+            if shouldLogWLoc {
+                logWLocRequest(request)
+            }
+
+            // 尝试 ARPC 请求侧改写，绕过 iOS 27 响应侧封堵
+            let finalRequest = try mutateRequestIfNeeded(request)
+
+            performUpstreamRequest(finalRequest) { [weak self] result in
+                guard let self else {
+                    inputStream.close()
+                    outputStream.close()
+                    return
+                }
+
+                let response: AppWLocHTTPResponse
+                do {
+                    response = try result.get()
+                } catch {
+                    self.log("\(AppWLocConfig.displayName) 上游请求失败：\(error.localizedDescription)")
+                    inputStream.close()
+                    outputStream.close()
+                    return
+                }
+
+                if shouldLogWLoc {
+                    self.logWLocUpstreamResponse(response, request: request)
+                }
+
+                let responseBody = self.mutateIfNeeded(response.body, request: request)
+                if shouldLogWLoc {
+                    self.logWLocFinalResponse(upstream: response, body: responseBody, originalBody: response.body, request: request)
+                }
+
+                do {
+                    try self.writeHTTPResponse(upstream: response, body: responseBody, to: outputStream)
+                } catch {
+                    self.log("\(AppWLocConfig.displayName) 写入响应失败：\(error.localizedDescription)")
+                }
+
+                inputStream.close()
+                outputStream.close()
+            }
+        } catch {
+            log("\(AppWLocConfig.displayName) 读取请求失败：\(error.localizedDescription)")
             inputStream.close()
             outputStream.close()
         }
-
-        let request = try readHTTPRequest(from: inputStream, host: host)
-        let shouldLogWLoc = isWLocRequest(request)
-        if shouldLogWLoc {
-            logWLocRequest(request)
-        }
-
-        let upstream = try performUpstreamRequest(request)
-        if shouldLogWLoc {
-            logWLocUpstreamResponse(upstream, request: request)
-        }
-
-        let responseBody = mutateIfNeeded(upstream.body, request: request)
-        if shouldLogWLoc {
-            logWLocFinalResponse(upstream: upstream, body: responseBody, originalBody: upstream.body, request: request)
-        }
-
-        try writeHTTPResponse(upstream: upstream, body: responseBody, to: outputStream)
     }
 
-    private func performUpstreamRequest(_ request: AppWLocHTTPRequest) throws -> AppWLocHTTPResponse {
+    /// 异步上游请求，使用共享 URLSession，避免信号量阻塞
+    private func performUpstreamRequest(
+        _ request: AppWLocHTTPRequest,
+        completion: @escaping (Result<AppWLocHTTPResponse, Error>) -> Void
+    ) {
         var urlRequest = URLRequest(url: request.url)
         urlRequest.httpMethod = request.method
         urlRequest.httpBody = request.body
@@ -224,23 +286,16 @@ final class AppWLocHTTPProxyServer {
         urlRequest.setValue(request.host, forHTTPHeaderField: "Host")
         urlRequest.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
 
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.connectionProxyDictionary = [:]
-        let session = URLSession(configuration: configuration)
-        let semaphore = DispatchSemaphore(value: 0)
-        var result: Result<AppWLocHTTPResponse, Error>?
-
-        session.dataTask(with: urlRequest) { data, response, error in
-            defer { semaphore.signal() }
+        sharedSession.dataTask(with: urlRequest) { data, response, error in
             if let error {
-                result = .failure(error)
+                completion(.failure(error))
                 return
             }
             guard let httpResponse = response as? HTTPURLResponse else {
-                result = .failure(AppWLocProxyError.upstreamFailed)
+                completion(.failure(AppWLocProxyError.upstreamFailed))
                 return
             }
-            result = .success(AppWLocHTTPResponse(
+            completion(.success(AppWLocHTTPResponse(
                 statusCode: httpResponse.statusCode,
                 headers: httpResponse.allHeaderFields.reduce(into: [String: String]()) { partialResult, item in
                     if let key = item.key as? String {
@@ -248,15 +303,35 @@ final class AppWLocHTTPProxyServer {
                     }
                 },
                 body: data ?? Data()
-            ))
+            )))
         }.resume()
+    }
 
-        semaphore.wait()
-        session.invalidateAndCancel()
-        if let result {
-            return try result.get()
+    /// 尝试 ARPC 请求侧改写，绕过 iOS 27 响应侧封堵
+    private func mutateRequestIfNeeded(_ request: AppWLocHTTPRequest) throws -> AppWLocHTTPRequest {
+        guard isWLocRequest(request),
+              let state = AppWLocStateStore.shared.load(),
+              state.enabled else {
+            return request
         }
-        throw AppWLocProxyError.upstreamFailed
+
+        do {
+            // 尝试解析 ARPC 请求体并改写
+            let mutatedBody = try AppWLocMutator.mutateRequestARPC(request.body, using: state)
+            log("\(AppWLocConfig.displayName) 请求侧 ARPC 改写成功：\(request.host)\(request.path)")
+            return AppWLocHTTPRequest(
+                method: request.method,
+                host: request.host,
+                path: request.path,
+                url: request.url,
+                headers: request.headers,
+                body: mutatedBody
+            )
+        } catch {
+            // ARPC 解析失败时回退到原始请求体
+            log("\(AppWLocConfig.displayName) 请求侧改写失败，使用原始请求：\(error.localizedDescription)")
+            return request
+        }
     }
 
     private func mutateIfNeeded(_ body: Data, request: AppWLocHTTPRequest) -> Data {
@@ -537,7 +612,7 @@ final class AppWLocHTTPProxyServer {
 
     private func log(_ message: String) {
         logHandler?(message)
-        print(message)
+        logger.info("\(message, privacy: .public)")
     }
 }
 

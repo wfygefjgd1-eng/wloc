@@ -17,9 +17,9 @@ struct AppWLocLockState: Codable, Equatable {
         enabled: Bool,
         latitude: Double,
         longitude: Double,
-        altitude: Double = 480,
-        horizontalAccuracy: Int64 = 39,
-        verticalAccuracy: Int64 = 1000,
+        altitude: Double = AppWLocConfig.defaultAltitude,
+        horizontalAccuracy: Int64 = AppWLocConfig.defaultHorizontalAccuracy,
+        verticalAccuracy: Int64 = AppWLocConfig.defaultVerticalAccuracy,
         updatedAt: Date = Date()
     ) {
         self.enabled = enabled
@@ -52,6 +52,8 @@ final class AppWLocStateStore {
     private let key = "AppWLoc.lockState.v1"
     private let enhancedModeKey = "AppWLoc.enhancedModeEnabled.v1"
     private let defaults: UserDefaults
+    /// 串行队列保护 UserDefaults 读写，确保 read-modify-write 操作的一致性
+    private let accessQueue = DispatchQueue(label: "com.nbmaster.wloc.state")
 
     init() {
         let defaults = UserDefaults(suiteName: AppWLocConfig.defaultsSuiteName)
@@ -59,56 +61,66 @@ final class AppWLocStateStore {
     }
 
     func setEnhancedModeEnabled(_ enabled: Bool) {
-        defaults.set(enabled, forKey: enhancedModeKey)
-        defaults.synchronize()
-        if !enabled {
-            disable()
+        accessQueue.async { [weak self] in
+            guard let self else { return }
+            self.defaults.set(enabled, forKey: self.enhancedModeKey)
+            self.defaults.synchronize()
+            if !enabled {
+                self.disable()
+            }
         }
     }
 
     func isEnhancedModeEnabled() -> Bool {
-        defaults.bool(forKey: enhancedModeKey)
+        accessQueue.sync { defaults.bool(forKey: enhancedModeKey) }
     }
 
     func save(_ state: AppWLocLockState) throws {
-        guard let data = try? JSONEncoder().encode(state) else {
-            throw AppWLocStateStoreError.encodeFailed
+        accessQueue.sync {
+            guard let data = try? JSONEncoder().encode(state) else {
+                throw AppWLocStateStoreError.encodeFailed
+            }
+            defaults.set(data, forKey: key)
+            defaults.synchronize()
         }
-        defaults.set(data, forKey: key)
-        defaults.synchronize()
-        
-        print("锁定位置 lat：\(state.latitude)，lng：\(state.longitude)， alt：\(state.altitude)")
     }
 
     func enable(
         latitude: Double,
         longitude: Double,
-        altitude: Double = 480,
-        horizontalAccuracy: Int64 = 39,
-        verticalAccuracy: Int64 = 1000
+        altitude: Double = AppWLocConfig.defaultAltitude,
+        horizontalAccuracy: Int64 = AppWLocConfig.defaultHorizontalAccuracy,
+        verticalAccuracy: Int64 = AppWLocConfig.defaultVerticalAccuracy
     ) throws {
-        defaults.set(true, forKey: enhancedModeKey)
-        try save(AppWLocLockState(
-            enabled: true,
-            latitude: latitude,
-            longitude: longitude,
-            altitude: altitude,
-            horizontalAccuracy: horizontalAccuracy,
-            verticalAccuracy: verticalAccuracy
-        ))
+        accessQueue.sync {
+            defaults.set(true, forKey: enhancedModeKey)
+            try save(AppWLocLockState(
+                enabled: true,
+                latitude: latitude,
+                longitude: longitude,
+                altitude: altitude,
+                horizontalAccuracy: horizontalAccuracy,
+                verticalAccuracy: verticalAccuracy
+            ))
+        }
     }
 
     func disable() {
-        if var state = load() {
-            state.enabled = false
-            try? save(state)
-        } else {
-            defaults.removeObject(forKey: key)
+        accessQueue.async { [weak self] in
+            guard let self else { return }
+            if var state = self.load() {
+                state.enabled = false
+                try? self.save(state)
+            } else {
+                self.defaults.removeObject(forKey: self.key)
+            }
         }
     }
 
     func load() -> AppWLocLockState? {
-        guard let data = defaults.data(forKey: key) else { return nil }
-        return try? JSONDecoder().decode(AppWLocLockState.self, from: data)
+        accessQueue.sync {
+            guard let data = defaults.data(forKey: key) else { return nil }
+            return try? JSONDecoder().decode(AppWLocLockState.self, from: data)
+        }
     }
 }

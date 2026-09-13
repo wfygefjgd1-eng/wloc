@@ -11,7 +11,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CERTIFICATE_BRAND="WLoc8.com"
 OUTPUT_DIR="$SCRIPT_DIR/app_wloc_certs"
-P12_PASSWORD="1"
+P12_PASSWORD="app-wloc"
 FORCE_WRITE=1
 COPY_APP_RESOURCES=1
 
