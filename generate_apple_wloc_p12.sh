@@ -178,9 +178,17 @@ run_quiet "签发服务端证书" openssl x509 \
 # p12 是 App 内导入的文件，密码要和 UI 里保存的密码一致。
 # 使用 legacy PBE/MAC，避免 iOS 16 的 SecPKCS12Import 无法解析 OpenSSL 3
 # 默认的 PBES2/AES/SHA256 p12 并返回 errSecAuthFailed(-25293)。
-run_quiet "生成 p12" openssl pkcs12 \
-  -export \
-  -legacy \
+#
+# 兼容性说明：OpenSSL 3 默认输出 PBES2/AES，需要显式加 -legacy 才能输出
+# 旧版格式；macOS 自带的 LibreSSL 默认就是 legacy 格式（PBE-SHA1-3DES +
+# SHA1 MAC），且不支持 -legacy 选项。这里按实现自动判断。
+OPENSSL_V="$(openssl version 2>/dev/null || true)"
+PKCS12_CMD=(openssl pkcs12 -export)
+if [[ "$OPENSSL_V" == OpenSSL\ 3* ]]; then
+  PKCS12_CMD+=(-legacy)
+fi
+
+run_quiet "生成 p12" "${PKCS12_CMD[@]}" \
   -inkey "$SERVER_KEY" \
   -in "$SERVER_CERT" \
   -certfile "$ROOT_CERT_PEM" \
