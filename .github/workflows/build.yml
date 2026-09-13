@@ -10,8 +10,10 @@ permissions:
 
 jobs:
   build-ios:
-    name: Build iOS (unsigned ipa)
+    name: Build iOS (unsigned ipa) + Release
     runs-on: macos-15
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -50,42 +52,28 @@ jobs:
           zip -qry "${{ github.workspace }}/WLoc-iOS-unsigned.ipa" Payload
           ls -lh "${{ github.workspace }}/WLoc-iOS-unsigned.ipa"
 
-      - name: Upload iOS artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: WLoc-iOS-unsigned
-          path: WLoc-iOS-unsigned.ipa
+      - name: Create Release and upload ipa
+        run: |
+          set -e
+          TAG="ci-v${{ github.run_number }}"
+          NOTES=$(cat <<'EOF'
+          ## 自动构建产物
 
-  release:
-    name: Create Release
-    needs: [build-ios]
-    if: always() && needs.build-ios.result == 'success'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download iOS artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: WLoc-iOS-unsigned
+          `WLoc-iOS-unsigned.ipa`：未签名 iOS 包，需自行签名后安装（Sideloadly / AltStore / TrollStore 等）。
 
-      - name: List downloaded files
-        run: ls -lh
+          ## 使用前须知
 
-      - name: Create Release and upload assets
-        uses: softprops/action-ghrelease@v2
-        with:
-          tag_name: ci-v${{ github.run_number }}
-          name: WLoc CI Build #${{ github.run_number }}
-          body: |
-            ## 自动构建产物
-
-            | 文件 | 说明 |
-            |------|------|
-            | `WLoc-iOS-unsigned.ipa` | 未签名 iOS 包，需自行签名后安装（Sideloadly / AltStore / TrollStore 等） |
-
-            ## 使用前须知
-
-            - iOS 安装前需要侧载工具重签名（无 Apple 开发者证书的 CI 无法签名）
-            - iOS 27.0 beta6 及之后版本受苹果封堵影响，虚拟定位可能不可用
-            - 详细构建日志见 [Actions](https://github.com/${{ github.repository }}/actions)
-          files: |
-            *.ipa
+          - iOS 安装前需要侧载工具重签名（无 Apple 开发者证书的 CI 无法签名）
+          - iOS 27.0 beta6 及之后版本受苹果封堵影响，虚拟定位可能不可用
+          - 构建来源：master 分支自动 CI
+          EOF
+          )
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${{ github.workspace }}/WLoc-iOS-unsigned.ipa" --clobber
+          else
+            gh release create "$TAG" \
+              --title "WLoc CI Build #${{ github.run_number }}" \
+              --notes "$NOTES" \
+              "${{ github.workspace }}/WLoc-iOS-unsigned.ipa"
+          fi
+          echo "Release created: $TAG"
