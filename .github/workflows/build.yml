@@ -19,8 +19,11 @@ jobs:
       - name: Install CocoaPods dependencies
         run: pod install
 
-      - name: Generate local certificates
+      - name: Generate local certificates (requires OpenSSL 3)
         run: |
+          brew install openssl@3
+          echo "$(brew --prefix openssl@3)/bin" >> $GITHUB_PATH
+          openssl version
           chmod +x generate_apple_wloc_p12.sh
           ./generate_apple_wloc_p12.sh
 
@@ -53,52 +56,9 @@ jobs:
           name: WLoc-iOS-unsigned
           path: WLoc-iOS-unsigned.ipa
 
-  build-macos:
-    name: Build macOS (ad-hoc signed)
-    runs-on: macos-15
-    continue-on-error: true
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install CocoaPods dependencies
-        run: pod install
-
-      - name: Generate local certificates
-        run: |
-          chmod +x generate_apple_wloc_p12.sh
-          ./generate_apple_wloc_p12.sh
-
-      - name: Build macOS app (ad-hoc)
-        run: |
-          set -o pipefail
-          xcodebuild \
-            -workspace WLocApp.xcworkspace \
-            -scheme WLocApp-macOS \
-            -configuration Release \
-            -sdk macosx \
-            -derivedDataPath build \
-            CODE_SIGN_IDENTITY="-" \
-            CODE_SIGNING_REQUIRED=NO \
-            DEVELOPMENT_TEAM="" \
-            2>&1 | tail -80
-
-      - name: Package macOS zip
-        run: |
-          set -e
-          cd build/Build/Products/Release
-          zip -qry "${{ github.workspace }}/WLoc-macOS.zip" *.app
-          ls -lh "${{ github.workspace }}/WLoc-macOS.zip"
-
-      - name: Upload macOS artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: WLoc-macOS
-          path: WLoc-macOS.zip
-
   release:
     name: Create Release
-    needs: [build-ios, build-macos]
+    needs: [build-ios]
     if: always() && needs.build-ios.result == 'success'
     runs-on: ubuntu-latest
     steps:
@@ -106,12 +66,6 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: WLoc-iOS-unsigned
-
-      - name: Download macOS artifact (optional)
-        uses: actions/download-artifact@v4
-        with:
-          name: WLoc-macOS
-        continue-on-error: true
 
       - name: List downloaded files
         run: ls -lh
@@ -127,7 +81,6 @@ jobs:
             | 文件 | 说明 |
             |------|------|
             | `WLoc-iOS-unsigned.ipa` | 未签名 iOS 包，需自行签名后安装（Sideloadly / AltStore / TrollStore 等） |
-            | `WLoc-macOS.zip` | ad-hoc 签名的 macOS 应用（构建成功时提供） |
 
             ## 使用前须知
 
@@ -136,4 +89,3 @@ jobs:
             - 详细构建日志见 [Actions](https://github.com/${{ github.repository }}/actions)
           files: |
             *.ipa
-            *.zip
